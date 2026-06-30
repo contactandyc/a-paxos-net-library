@@ -1,0 +1,36 @@
+project_title: a-paxos-net-library
+version: "0.1.5"
+description: "A Multi-Paxos Net implementation"
+stack: c/cmake
+date_created: 2026-07-25
+
+profile: default
+
+# ── 1. Scaffolding Engine Source ──
+base_templates:
+  repo: https://github.com/contactandyc/scaffold-templates.git
+  ref: main
+
+# ── Dynamic Setup Variables ──
+c_standard: "23"
+cxx_standard: "17"
+
+# ── 3. Licenses & Legal ──
+# license_profile: apache-2.0
+# license_overrides:
+#   "src/vendor/**": mit
+
+examples:
+  basic:
+    targets:
+      basic_paxos:
+        - src/main.c
+
+
+# ── 4. Dependencies ──
+depends_on:
+  # - common/libuv
+  # - https://github.com/contactandyc/a-write-ahead-log.git
+  - https://github.com/contactandyc/h2o-c-library.git
+  - https://github.com/contactandyc/the-macro-library.git
+  - https://github.com/contactandyc/a-paxos-core.git
