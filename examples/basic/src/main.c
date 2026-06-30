@@ -5,6 +5,7 @@
 
 #include "a-table-store-library/lsm_env.h"
 #include "a-table-store-library/lsm_db.h"
+#include "a-table-store-library/lsm_posix.h" // Needed for local_posix_backend
 #include "a-paxos-net-library/paxos_net.h"
 
 #include <stdio.h>
@@ -26,12 +27,14 @@ static void on_paxos_apply(void *app_ctx, uint64_t slot, uint8_t op, const void 
 }
 
 // Fired by H2O threads for Read-Only GET requests
-static h2o_c_response_t* on_http_get(void *app_ctx, h2o_c_req_t *req, const char *path) {
+static void on_http_get(void *app_ctx, h2o_c_req_t *req, const char *path) {
     lsm_db_t *db = (lsm_db_t *)app_ctx;
 
     // Route: GET /key/{actual_key}
     if (strncmp(path, "/key/", 5) != 0) {
-        return h2o_c_make_response(400, "Bad Request", "Invalid Path", 12, "text/plain");
+        h2o_c_response_t *resp = h2o_c_make_response(400, "Bad Request", "Invalid Path", 12, "text/plain");
+        h2o_c_send_response(req, resp);
+        return;
     }
 
     const char *key = path + 5;
@@ -42,14 +45,25 @@ static h2o_c_response_t* on_http_get(void *app_ctx, h2o_c_req_t *req, const char
     void *val = lsm_db_get(db, key, klen, UINT64_MAX, &vlen);
 
     if (!val) {
-        return h2o_c_make_response(404, "Not Found", "Key not found", 13, "text/plain");
+        h2o_c_response_t *resp = h2o_c_make_response(404, "Not Found", "Key not found", 13, "text/plain");
+        h2o_c_send_response(req, resp);
+        return;
     }
 
     // h2o_c_make_response will copy the buffer, so we can free the LSM allocation safely
     h2o_c_response_t *resp = h2o_c_make_response(200, "OK", val, vlen, "application/octet-stream");
+    h2o_c_send_response(req, resp);
     free(val);
+}
 
-    return resp;
+// Dummy snapshot callbacks to prevent segfaults
+static void on_snapshot_create(void *ctx, uint64_t *out_idx) {
+    (void)ctx;
+    *out_idx = 0;
+}
+
+static void on_snapshot_chunk_recv(void *ctx, uint64_t s, uint64_t o, const uint8_t *d, size_t l, bool f) {
+    (void)ctx; (void)s; (void)o; (void)d; (void)l; (void)f;
 }
 
 // --- Main Daemon ---
@@ -79,10 +93,11 @@ int main(int argc, char **argv) {
         .app_ctx = db,
         .on_apply = on_paxos_apply,
         .on_http_get = on_http_get,
-        // (Snapshot callbacks omitted for brevity)
+        .on_snapshot_create = on_snapshot_create,
+        .on_snapshot_chunk_recv = on_snapshot_chunk_recv
     };
 
-    // 3. Configure Paxos Topolgy
+    // 3. Configure Paxos Topology
     // Assuming a 3-node cluster: IDs 1, 2, and 3.
     uint64_t initial_voters[] = {1, 2, 3};
     paxos_config_t pcfg = {
@@ -98,13 +113,13 @@ int main(int argc, char **argv) {
     // 4. Configure Networking
     paxos_server_options_t net_opts = {
         .node_id = my_node_id,
-        .p2p_port = 9000 + my_node_id, // e.g., 9001
+        .p2p_port = 9000 + (int)my_node_id, // e.g., 9001
         .tick_ms = 10,                 // 10ms Paxos tick resolution
         .h2o = {
             .enable_ssl = false,
             .enable_http2 = true,
             .thread_pool_size = 4,
-            .port = 8000 + my_node_id, // e.g., 8001
+            .port = 8000 + (int)my_node_id, // e.g., 8001
             .address = "0.0.0.0"
         }
     };

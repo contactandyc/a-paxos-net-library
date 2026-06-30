@@ -265,7 +265,12 @@ install(FILES
 # Extra project-specific targets
 
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  enable_testing()
+  add_subdirectory("tests")
+endif()
 
 # Dynamically mount all subprojects (apps, examples, tests, etc.)
 # # add_subdirectory(examples/basic)
+# # add_subdirectory(tests)
 # 

@@ -3,22 +3,7 @@
 //
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
-#include "a-paxos-net-library/paxos_net.h"
-
-// Internal State Machine definition
-typedef enum {
-    SYNC_IDLE = 0,
-    SYNC_EVALUATING,
-    SYNC_DOWNLOADING_FILE,
-    SYNC_FETCH_LOG
-} sync_state_t;
-
-typedef struct {
-    sync_state_t state;
-    uint64_t target_index;
-    uint64_t active_target_node;
-    uint64_t last_progress_ms;
-} sync_manager_t;
+#include "paxos_net_internal.h"
 
 static uint64_t current_time_ms() {
     return uv_hrtime() / 1000000;
@@ -44,7 +29,7 @@ static uint64_t select_best_sync_peer(paxos_server_t *s, uint64_t my_commit_inde
         if (latency_ms < 0) continue;
 
         int score = latency_ms;
-        if (is_leader) score += 10000; // Penalize leader
+        if (is_leader) score += 10000;
 
         if (best_score == -1 || score < best_score) {
             best_score = score;
@@ -55,13 +40,12 @@ static uint64_t select_best_sync_peer(paxos_server_t *s, uint64_t my_commit_inde
     return best_peer;
 }
 
-// Called periodically by the libuv event loop in the Paxos Thread
-void sync_manager_tick(paxos_server_t *s, sync_manager_t *sm) {
+void sync_manager_tick(paxos_server_t *s) {
+    sync_manager_t *sm = &s->sync_mgr;
     if (sm->state == SYNC_IDLE) return;
 
     uint64_t now = current_time_ms();
 
-    // Timeout detection
     if (sm->state != SYNC_EVALUATING && (now - sm->last_progress_ms > 2000)) {
         sm->active_target_node = 0;
         sm->state = SYNC_EVALUATING;

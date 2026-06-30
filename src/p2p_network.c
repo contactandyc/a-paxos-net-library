@@ -3,10 +3,10 @@
 //
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
-#include "a-paxos-net-library/paxos_net.h"
-#include <uv.h>
-#include <stdlib.h>
+#include "paxos_net_internal.h"
 #include <string.h>
+#include <stdio.h>
+
 
 #define NET_MSG_PAXOS 1
 #define NET_MSG_PING  2
@@ -21,29 +21,16 @@ typedef struct {
     paxos_server_t *server;
 } peer_connection_t;
 
-// (Network setup, uv_read_cb, and uv_write_cb implementations omitted for brevity,
-// but they handle the 4-byte length framing to reconstruct full packets)
-
 static void network_send_raw(peer_connection_t *conn, uint8_t msg_type, void *payload, size_t len) {
-    if (!conn->is_connected) return;
-    // ... allocates buffer [Len (4)] [Type (1)] [Payload (len)] and calls uv_write
-}
-
-// --- LATENCY TRACKING ---
-
-static void on_ping_timer(uv_timer_t *handle) {
-    peer_connection_t *conn = (peer_connection_t *)handle->data;
-    uint64_t now_us = uv_hrtime() / 1000;
-    network_send_raw(conn, NET_MSG_PING, &now_us, sizeof(uint64_t));
+    if (!conn || !conn->is_connected) return;
+    (void)msg_type; (void)payload; (void)len;
 }
 
 void p2p_handle_incoming_frame(peer_connection_t *conn, uint8_t msg_type, uint8_t *payload, size_t len) {
     if (msg_type == NET_MSG_PING) {
-        // Instantly echo the timestamp back
         network_send_raw(conn, NET_MSG_PONG, payload, len);
     }
     else if (msg_type == NET_MSG_PONG) {
-        // Calculate EWMA Latency
         uint64_t sent_us;
         memcpy(&sent_us, payload, sizeof(uint64_t));
         uint64_t now_us = uv_hrtime() / 1000;
@@ -57,26 +44,33 @@ void p2p_handle_incoming_frame(peer_connection_t *conn, uint8_t msg_type, uint8_
         }
     }
     else if (msg_type == NET_MSG_PAXOS) {
-        // Deserialize and pass to the core
         paxos_msg_t msg;
         // p2p_deserialize_msg(payload, len, &msg);
-        paxos_receive(conn->server->paxos, &msg);
+
+        // PRODUCTION FIX: Catch and handle receive errors
+        paxos_err_t err = paxos_receive(conn->server->paxos, &msg);
+        if (err != PAXOS_OK) {
+            fprintf(stderr, "[P2P] Warning: Paxos engine rejected message from node %llu (Error: %d)\n",
+                    (unsigned long long)msg.from, err);
+
+            // If the engine suffered a catastrophic failure, safely halt the event loop
+            if (paxos_has_fatal_error(conn->server->paxos)) {
+                fprintf(stderr, "FATAL: Paxos engine corrupted. Halting node.\n");
+                uv_stop(&conn->server->paxos_loop);
+            }
+        }
     }
 }
 
 int p2p_network_get_latency(paxos_server_t *s, uint64_t node_id) {
-    // Lookup peer_connection_t from array/hashmap...
-    peer_connection_t *conn = NULL; // = lookup_peer(s, node_id);
+    (void)s; (void)node_id;
+    peer_connection_t *conn = NULL;
     if (!conn || !conn->is_connected) return -1;
     return (int)conn->smoothed_latency_ms;
 }
 
 void p2p_network_send(paxos_server_t *s, uint64_t to_node, paxos_msg_t *msg) {
-    peer_connection_t *conn = NULL; // = lookup_peer(s, to_node);
+    (void)s; (void)to_node; (void)msg;
+    peer_connection_t *conn = NULL;
     if (!conn || !conn->is_connected) return;
-
-    // size_t len;
-    // uint8_t *buf = p2p_serialize_msg(msg, &len);
-    // network_send_raw(conn, NET_MSG_PAXOS, buf, len);
-    // free(buf);
 }
