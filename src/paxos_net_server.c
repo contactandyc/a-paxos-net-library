@@ -177,6 +177,13 @@ static void on_paxos_tick(uv_timer_t *handle) {
     process_paxos_ready(s);
 }
 
+static void paxos_close_walk_cb(uv_handle_t* handle, void* arg) {
+    (void)arg;
+    if (!uv_is_closing(handle)) {
+        uv_close(handle, NULL);
+    }
+}
+
 static void paxos_thread_entry(void *arg) {
     paxos_server_t *s = (paxos_server_t *)arg;
     uv_loop_init(&s->paxos_loop);
@@ -190,7 +197,12 @@ static void paxos_thread_entry(void *arg) {
 
     p2p_network_init(s);
 
+    // Run the primary loop
     uv_run(&s->paxos_loop, UV_RUN_DEFAULT);
+
+    // --- ADD THESE 3 LINES FOR CLEAN TEARDOWN ---
+    uv_walk(&s->paxos_loop, paxos_close_walk_cb, NULL);
+    uv_run(&s->paxos_loop, UV_RUN_DEFAULT); // Drain the close callbacks
     uv_loop_close(&s->paxos_loop);
 }
 
@@ -215,17 +227,21 @@ void paxos_server_run(paxos_server_t *s) {
     s->running = true;
     uv_thread_create(&s->paxos_thread, paxos_thread_entry, s);
 
-    h2o_c_init(&s->opts.h2o);
-    h2o_c_use("GET", NULL, http_handler, s);
-    h2o_c_use("PUT", NULL, http_handler, s);
-    h2o_c_use("DELETE", NULL, http_handler, s);
-    h2o_c_run();
+    s->http_server = h2o_c_init(&s->opts.h2o);
+
+    // Bind the handlers explicitly to this server instance
+    h2o_c_use(s->http_server, "GET", NULL, http_handler, s);
+    h2o_c_use(s->http_server, "PUT", NULL, http_handler, s);
+    h2o_c_use(s->http_server, "DELETE", NULL, http_handler, s);
+
+    // Run the isolated instance
+    h2o_c_run(s->http_server);
 }
 
 void paxos_server_stop(paxos_server_t *s) {
     if (s && s->running) {
         s->running = false;
-        h2o_c_stop();
+        h2o_c_stop(s->http_server);
         uv_stop(&s->paxos_loop);
     }
 }
@@ -233,6 +249,6 @@ void paxos_server_stop(paxos_server_t *s) {
 void paxos_server_destroy(paxos_server_t *s) {
     if (!s) return;
     paxos_destroy(s->paxos);
-    h2o_c_destroy();
+    h2o_c_destroy(s->http_server);
     free(s);
 }

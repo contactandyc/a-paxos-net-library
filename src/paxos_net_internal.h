@@ -44,6 +44,8 @@ struct paxos_server_s {
     paxos_app_machine_t app;
     paxos_server_options_t opts;
 
+    h2o_c_server_t *http_server;
+
     // Cross-Thread Queue
     pthread_mutex_t cmd_mutex;
     incoming_cmd_t *cmd_queue_head;
