@@ -139,8 +139,17 @@ static void process_paxos_ready(paxos_server_t *s) {
         sync_manager_tick(s);
     }
 
-    if (max_applied > 0 || ready.num_entries_to_save > 0) {
-        // PRODUCTION FIX: Extract just the slot numbers to feed back to the engine
+    // Determine if ANY work was yielded by the state machine
+    bool needs_advance = false;
+    if (ready.hard_state.has_update ||
+        ready.num_entries_to_save > 0 ||
+        max_applied > 0 ||
+        ready.num_messages_immediate > 0 ||
+        ready.num_messages_after_persist > 0) {
+        needs_advance = true;
+    }
+
+    if (needs_advance) {
         uint64_t *stable_slots = NULL;
         if (ready.num_entries_to_save > 0) {
             stable_slots = malloc(ready.num_entries_to_save * sizeof(uint64_t));
@@ -149,6 +158,7 @@ static void process_paxos_ready(paxos_server_t *s) {
             }
         }
 
+        // Advance the state machine, clearing the queues and updating internal state
         paxos_advance(s->paxos, stable_slots, ready.num_entries_to_save, max_applied);
 
         if (stable_slots) free(stable_slots);
