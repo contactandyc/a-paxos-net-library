@@ -26,7 +26,7 @@ typedef struct {
     size_t read_cap;
 } peer_connection_t;
 
-// Hardcoded for the 3-Node Example (In production, load this from config/dynamic discovery)
+// Hardcoded for the 3-Node Example
 #define MAX_PEERS 4
 static peer_connection_t g_peers[MAX_PEERS];
 static uv_tcp_t g_listener;
@@ -49,7 +49,7 @@ static inline uint64_t dec64(const uint8_t *src) {
 }
 
 static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
-    size_t req_len = 66; // Base size
+    size_t req_len = 66;
     for (size_t i = 0; i < msg->num_entries; i++) {
         req_len += 21 + msg->entries[i].data_len;
     }
@@ -117,7 +117,7 @@ static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg
     if (msg->num_entries > 0) {
         msg->entries = calloc(msg->num_entries, sizeof(paxos_entry_t));
         for (size_t i = 0; i < msg->num_entries; i++) {
-            if (ptr + 21 > len) break; // Malformed packet protection
+            if (ptr + 21 > len) break;
             paxos_entry_t *e = &msg->entries[i];
             e->slot = dec64(buf + ptr); ptr += 8;
             e->accepted_ballot = dec64(buf + ptr); ptr += 8;
@@ -155,7 +155,6 @@ static void free_paxos_msg_payload(paxos_msg_t *msg) {
 
 // --- NETWORK FRAMING & I/O ---
 
-// FIX: Standard C callback instead of C++ lambda
 static void on_write_done(uv_write_t *req, int status) {
     (void)status;
     free(req->data);
@@ -219,13 +218,33 @@ static void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     buf->len = suggested_size;
 }
 
+// Cleanly free incoming anonymous sockets on disconnect
+static void on_anon_close(uv_handle_t *handle) {
+    peer_connection_t *conn = (peer_connection_t *)handle->data;
+    if (conn->read_buf) free(conn->read_buf);
+    free(conn);
+}
+
+// Reset outgoing fixed sockets so they can be retried
+static void on_outgoing_close(uv_handle_t *handle) {
+    peer_connection_t *conn = (peer_connection_t *)handle->data;
+    conn->socket.type = UV_UNKNOWN_HANDLE; // Mark as safely closed
+}
+
 static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     peer_connection_t *conn = (peer_connection_t *)stream->data;
 
     if (nread < 0) {
-        if (nread != UV_EOF) fprintf(stderr, "[P2P] Read error %s\n", uv_err_name(nread));
-        uv_close((uv_handle_t*)stream, NULL);
         conn->is_connected = false;
+
+        if (conn->peer_node_id == 0) {
+            // It's an incoming anonymous socket. Free it entirely.
+            uv_close((uv_handle_t*)stream, on_anon_close);
+        } else {
+            // It's a tracked outgoing connection. Mark closed to allow retry.
+            uv_close((uv_handle_t*)stream, on_outgoing_close);
+        }
+
         if (buf->base) free(buf->base);
         return;
     }
@@ -266,8 +285,8 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 static void on_connect(uv_connect_t *req, int status) {
     peer_connection_t *conn = (peer_connection_t *)req->data;
     if (status < 0) {
-        uv_close((uv_handle_t*)&conn->socket, NULL);
-        return; // Will retry via timer
+        uv_close((uv_handle_t*)&conn->socket, on_outgoing_close);
+        return;
     }
     conn->is_connected = true;
     uv_read_start((uv_stream_t*)&conn->socket, on_alloc, on_read);
@@ -277,16 +296,15 @@ static void try_connect(uv_timer_t *handle) {
     peer_connection_t *conn = (peer_connection_t *)handle->data;
     if (conn->is_connected || conn->peer_node_id == conn->server->opts.node_id) return;
 
-    if (!uv_is_closing((uv_handle_t*)&conn->socket)) {
-        // Assume simple topology: Node N binds to port 9000 + N
-        struct sockaddr_in dest;
-        uv_ip4_addr("127.0.0.1", 9000 + (int)conn->peer_node_id, &dest);
+    // Wait until libuv safely closes the old handle before trying again
+    if (conn->socket.type != UV_UNKNOWN_HANDLE) return;
 
-        // FIX: Provide the pointer to the loop, not the struct itself
-        uv_tcp_init(&conn->server->paxos_loop, &conn->socket);
-        conn->socket.data = conn;
-        uv_tcp_connect(&conn->connect_req, &conn->socket, (const struct sockaddr*)&dest, on_connect);
-    }
+    struct sockaddr_in dest;
+    uv_ip4_addr("127.0.0.1", 9000 + (int)conn->peer_node_id, &dest);
+
+    uv_tcp_init(&conn->server->paxos_loop, &conn->socket);
+    conn->socket.data = conn;
+    uv_tcp_connect(&conn->connect_req, &conn->socket, (const struct sockaddr*)&dest, on_connect);
 }
 
 static void on_ping_timer(uv_timer_t *handle) {
@@ -297,40 +315,34 @@ static void on_ping_timer(uv_timer_t *handle) {
     network_send_raw(conn, NET_MSG_PING, buf, 8);
 }
 
-// FIX: Standard C callback instead of C++ lambda
-static void on_close_free(uv_handle_t *handle) {
-    free(handle);
-}
-
 static void on_accept(uv_stream_t *server, int status) {
     if (status < 0) return;
 
-    uv_tcp_t *client = malloc(sizeof(uv_tcp_t));
-    uv_tcp_init(server->loop, client);
+    // PRODUCTION FIX: Initialize the socket inside the connection struct
+    peer_connection_t *anon_conn = calloc(1, sizeof(peer_connection_t));
+    anon_conn->server = ((peer_connection_t*)server->data)->server;
+    anon_conn->is_connected = true;
+    anon_conn->read_cap = 4096;
+    anon_conn->read_buf = malloc(4096);
 
-    if (uv_accept(server, (uv_stream_t*)client) == 0) {
-        // In a real system, you'd handshake to find the Node ID.
-        // For this demo, we just assign it to an empty peer slot or handle it anonymously.
-        peer_connection_t *anon_conn = calloc(1, sizeof(peer_connection_t));
-        anon_conn->server = ((peer_connection_t*)server->data)->server;
-        anon_conn->is_connected = true;
-        anon_conn->read_cap = 4096;
-        anon_conn->read_buf = malloc(4096);
-        client->data = anon_conn;
-        uv_read_start((uv_stream_t*)client, on_alloc, on_read);
+    uv_tcp_init(server->loop, &anon_conn->socket);
+    anon_conn->socket.data = anon_conn;
+
+    if (uv_accept(server, (uv_stream_t*)&anon_conn->socket) == 0) {
+        uv_read_start((uv_stream_t*)&anon_conn->socket, on_alloc, on_read);
     } else {
-        uv_close((uv_handle_t*)client, on_close_free);
+        uv_close((uv_handle_t*)&anon_conn->socket, on_anon_close);
     }
 }
 
 // --- PUBLIC P2P API ---
 
 void p2p_network_init(paxos_server_t *s) {
-    // 1. Initialize our Outgoing Peer Connections
     for (int i = 1; i <= 3; i++) {
         g_peers[i].peer_node_id = i;
         g_peers[i].server = s;
         g_peers[i].is_connected = false;
+        g_peers[i].socket.type = UV_UNKNOWN_HANDLE; // Mark clean for first connect
         g_peers[i].read_cap = 4096;
         g_peers[i].read_buf = malloc(4096);
         g_peers[i].read_pos = 0;
@@ -339,16 +351,15 @@ void p2p_network_init(paxos_server_t *s) {
 
         uv_timer_init(&s->paxos_loop, &g_peers[i].reconnect_timer);
         g_peers[i].reconnect_timer.data = &g_peers[i];
-        uv_timer_start(&g_peers[i].reconnect_timer, try_connect, 0, 1000); // Retry every 1s
+        uv_timer_start(&g_peers[i].reconnect_timer, try_connect, 0, 1000);
 
         uv_timer_init(&s->paxos_loop, &g_peers[i].ping_timer);
         g_peers[i].ping_timer.data = &g_peers[i];
-        uv_timer_start(&g_peers[i].ping_timer, on_ping_timer, 500, 500); // Ping every 500ms
+        uv_timer_start(&g_peers[i].ping_timer, on_ping_timer, 500, 500);
     }
 
-    // 2. Start Listening for Incoming Connections
     uv_tcp_init(&s->paxos_loop, &g_listener);
-    g_listener.data = &g_peers[1]; // Store server context somewhere
+    g_listener.data = &g_peers[1];
 
     struct sockaddr_in addr;
     uv_ip4_addr("0.0.0.0", s->opts.p2p_port, &addr);
