@@ -49,12 +49,11 @@ static inline uint64_t dec64(const uint8_t *src) {
 }
 
 static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
-    // PRODUCTION FIX: Defensive clamping. Protect against uninitialized stack
-    // memory from the core engine by enforcing length limits if pointers are NULL.
     uint32_t safe_num_entries = (msg->entries != NULL) ? msg->num_entries : 0;
     uint32_t safe_snap_len = (msg->snapshot_data != NULL) ? msg->snapshot_len : 0;
 
-    size_t req_len = 66; // Base size
+    // PRODUCTION FIX: The base size of the header is exactly 83 bytes.
+    size_t req_len = 83;
     for (size_t i = 0; i < safe_num_entries; i++) {
         req_len += 21 + msg->entries[i].data_len;
     }
@@ -102,7 +101,9 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
 
 static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg) {
     memset(msg, 0, sizeof(paxos_msg_t));
-    if (len < 66) return;
+
+    // PRODUCTION FIX: Drop packets smaller than the 83-byte base header
+    if (len < 83) return;
 
     size_t ptr = 0;
     msg->to = dec64(buf + ptr); ptr += 8;
