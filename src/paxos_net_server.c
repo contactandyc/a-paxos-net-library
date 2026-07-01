@@ -6,17 +6,92 @@
 #include <stdio.h>
 
 // --- HTTP REQUEST HANDLER ---
+// --- HTTP REQUEST HANDLER ---
 static void http_handler(h2o_c_req_t *req, void *arg, const char *method, const char *path, h2o_c_header_t *in_headers, const char *body, size_t body_len) {
     (void)in_headers; // Silence unused parameter warning
 
     paxos_server_t *s = (paxos_server_t *)arg;
 
+    // 1. GET requests bypass consensus for eventual consistency (Read from local LSM)
     if (strcmp(method, "GET") == 0) {
         s->app.on_http_get(s->app.app_ctx, req, path);
         return;
     }
 
+    // 2. PUT / DELETE requests must be routed to the Leader
     if (strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0) {
+
+        // FIX: Check if we are the leader first!
+        uint64_t leader_id = 0;
+        if (paxos_peer_is_leader(s->paxos, s->opts.node_id)) {
+            leader_id = s->opts.node_id;
+        } else {
+            // Otherwise, ask our remote peers
+            uint64_t *peers = NULL;
+            size_t num_peers = paxos_get_peers(s->paxos, &peers);
+
+            for (size_t i = 0; i < num_peers; i++) {
+                if (paxos_peer_is_leader(s->paxos, peers[i])) {
+                    leader_id = peers[i];
+                    break;
+                }
+            }
+            if (peers) free(peers);
+        }
+
+        // Scenario A: The cluster is currently electing a leader
+        if (leader_id == 0) {
+            h2o_c_response_t *resp = h2o_c_make_response(503, "Service Unavailable", "Cluster Electing Leader", 23, "text/plain");
+            h2o_c_send_response(req, resp);
+            return;
+        }
+
+        // Scenario B: We are a FOLLOWER. Issue a 307 Redirect.
+        if (leader_id != s->opts.node_id) {
+
+            // Assume the standard port convention (8000 + Node ID)
+            int leader_port = 8000 + (int)leader_id;
+
+            char location_buf[256];
+            snprintf(location_buf, sizeof(location_buf), "http://127.0.0.1:%d%s", leader_port, path);
+
+            char leader_id_str[32];
+            snprintf(leader_id_str, sizeof(leader_id_str), "%llu", (unsigned long long)leader_id);
+
+            char leader_addr_str[64];
+            snprintf(leader_addr_str, sizeof(leader_addr_str), "127.0.0.1:%d", leader_port);
+
+            // Construct the 307 Response (No body needed)
+            h2o_c_response_t *resp = h2o_c_make_response(307, "Temporary Redirect", NULL, 0, "text/plain");
+
+            // Generate our custom headers
+            h2o_c_header_t *h_loc = calloc(1, sizeof(h2o_c_header_t));
+            h_loc->key = strdup("Location");
+            h_loc->value = strdup(location_buf);
+
+            h2o_c_header_t *h_id = calloc(1, sizeof(h2o_c_header_t));
+            h_id->key = strdup("X-Paxos-Leader-Id");
+            h_id->value = strdup(leader_id_str);
+
+            // FIX: Renamed from h_addr to h_leader_addr to avoid <netdb.h> macro collision
+            h2o_c_header_t *h_leader_addr = calloc(1, sizeof(h2o_c_header_t));
+            h_leader_addr->key = strdup("X-Paxos-Leader-Address");
+            h_leader_addr->value = strdup(leader_addr_str);
+
+            // Chain them together
+            h_loc->next = h_id;
+            h_id->next = h_leader_addr;
+
+            // Append them to the existing headers (Content-Type, Content-Length)
+            h2o_c_header_t *tail = resp->headers;
+            while (tail && tail->next) tail = tail->next;
+            tail->next = h_loc;
+
+            h2o_c_send_response(req, resp);
+            return;
+        }
+
+        // Scenario C: We are the LEADER. Process the command through Paxos.
         incoming_cmd_t *cmd = calloc(1, sizeof(incoming_cmd_t));
         cmd->http_req = req;
         cmd->client_seq = atomic_fetch_add(&s->seq_generator, 1);
@@ -39,6 +114,7 @@ static void http_handler(h2o_c_req_t *req, void *arg, const char *method, const 
         return;
     }
 
+    // Fallback for unsupported HTTP methods
     h2o_c_response_t *err = h2o_c_make_response(400, "Bad Request", "Invalid Method", 14, "text/plain");
     h2o_c_send_response(req, err);
 }
