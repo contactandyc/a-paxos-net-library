@@ -49,11 +49,16 @@ static inline uint64_t dec64(const uint8_t *src) {
 }
 
 static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
-    size_t req_len = 66;
-    for (size_t i = 0; i < msg->num_entries; i++) {
+    // PRODUCTION FIX: Defensive clamping. Protect against uninitialized stack
+    // memory from the core engine by enforcing length limits if pointers are NULL.
+    uint32_t safe_num_entries = (msg->entries != NULL) ? msg->num_entries : 0;
+    uint32_t safe_snap_len = (msg->snapshot_data != NULL) ? msg->snapshot_len : 0;
+
+    size_t req_len = 66; // Base size
+    for (size_t i = 0; i < safe_num_entries; i++) {
         req_len += 21 + msg->entries[i].data_len;
     }
-    req_len += msg->snapshot_len;
+    req_len += safe_snap_len;
 
     uint8_t *buf = malloc(req_len);
     size_t ptr = 0;
@@ -71,24 +76,24 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
     buf[ptr++] = msg->reject ? 1 : 0;
     buf[ptr++] = msg->snapshot_done ? 1 : 0;
 
-    enc32(buf + ptr, (uint32_t)msg->num_entries); ptr += 4;
-    for (size_t i = 0; i < msg->num_entries; i++) {
+    enc32(buf + ptr, safe_num_entries); ptr += 4;
+    for (size_t i = 0; i < safe_num_entries; i++) {
         paxos_entry_t *e = &msg->entries[i];
         enc64(buf + ptr, e->slot); ptr += 8;
         enc64(buf + ptr, e->accepted_ballot); ptr += 8;
         buf[ptr++] = e->type;
         enc32(buf + ptr, (uint32_t)e->data_len); ptr += 4;
-        if (e->data_len > 0) {
+        if (e->data_len > 0 && e->data != NULL) {
             memcpy(buf + ptr, e->data, e->data_len);
             ptr += e->data_len;
         }
     }
 
     enc64(buf + ptr, msg->snapshot_offset); ptr += 8;
-    enc32(buf + ptr, (uint32_t)msg->snapshot_len); ptr += 4;
-    if (msg->snapshot_len > 0) {
-        memcpy(buf + ptr, msg->snapshot_data, msg->snapshot_len);
-        ptr += msg->snapshot_len;
+    enc32(buf + ptr, safe_snap_len); ptr += 4;
+    if (safe_snap_len > 0) {
+        memcpy(buf + ptr, msg->snapshot_data, safe_snap_len);
+        ptr += safe_snap_len;
     }
 
     *out_len = ptr;
