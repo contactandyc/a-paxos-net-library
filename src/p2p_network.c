@@ -206,12 +206,12 @@ static void p2p_handle_incoming_frame(peer_connection_t *conn, uint8_t msg_type,
 
         paxos_err_t err = paxos_receive(conn->server->paxos, &msg);
         if (err != PAXOS_OK) {
-            fprintf(stderr, "[P2P] Warning: Paxos engine rejected message from node %llu (Error: %d)\n",
-                    (unsigned long long)msg.from, err);
-
             if (paxos_has_fatal_error(conn->server->paxos)) {
                 fprintf(stderr, "FATAL: Paxos engine corrupted. Halting node.\n");
                 uv_stop(&conn->server->paxos_loop);
+            } else if (err != -6) {
+                // Only print actual unexpected errors, not routine stale packet ignores
+                fprintf(stderr, "[P2P] Warning: Paxos rejected msg (Error: %d)\n", err);
             }
         }
         free_paxos_msg_payload(&msg);

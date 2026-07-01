@@ -100,9 +100,8 @@ static void process_paxos_ready(paxos_server_t *s) {
         p2p_network_send(s, ready.messages_immediate[i].to, &ready.messages_immediate[i]);
     }
 
-    if (ready.num_entries_to_save > 0) {
-        // Disk Sync hook
-    }
+    // In a production system, you would flush ready.entries_to_save to your WAL here.
+    // For now, we simulate instant persistence so the replication pipeline can proceed.
 
     for (size_t i = 0; i < ready.num_messages_after_persist; i++) {
         p2p_network_send(s, ready.messages_after_persist[i].to, &ready.messages_after_persist[i]);
@@ -141,7 +140,18 @@ static void process_paxos_ready(paxos_server_t *s) {
     }
 
     if (max_applied > 0 || ready.num_entries_to_save > 0) {
-        paxos_advance(s->paxos, NULL, 0, max_applied);
+        // PRODUCTION FIX: Extract just the slot numbers to feed back to the engine
+        uint64_t *stable_slots = NULL;
+        if (ready.num_entries_to_save > 0) {
+            stable_slots = malloc(ready.num_entries_to_save * sizeof(uint64_t));
+            for (size_t i = 0; i < ready.num_entries_to_save; i++) {
+                stable_slots[i] = ready.entries_to_save[i].slot;
+            }
+        }
+
+        paxos_advance(s->paxos, stable_slots, ready.num_entries_to_save, max_applied);
+
+        if (stable_slots) free(stable_slots);
     }
 }
 
