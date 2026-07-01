@@ -26,10 +26,11 @@ typedef struct {
     size_t read_cap;
 } peer_connection_t;
 
-// Hardcoded for the 3-Node Example
 #define MAX_PEERS 4
-static peer_connection_t g_peers[MAX_PEERS];
-static uv_tcp_t g_listener;
+typedef struct {
+    peer_connection_t peers[MAX_PEERS];
+    uv_tcp_t listener;
+} p2p_state_t;
 
 // --- SERIALIZATION ---
 
@@ -241,7 +242,6 @@ static void p2p_handle_incoming_frame(peer_connection_t *conn, uint8_t msg_type,
                 fprintf(stderr, "FATAL: Paxos engine corrupted. Halting node.\n");
                 uv_stop(&conn->server->paxos_loop);
             } else if (err != -6) {
-                // Only print actual unexpected errors, not routine stale packet ignores
                 fprintf(stderr, "[P2P] Warning: Paxos rejected msg (Error: %d)\n", err);
             }
         }
@@ -255,14 +255,12 @@ static void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) 
     buf->len = suggested_size;
 }
 
-// Cleanly free incoming anonymous sockets on disconnect
 static void on_anon_close(uv_handle_t *handle) {
     peer_connection_t *conn = (peer_connection_t *)handle->data;
     if (conn->read_buf) free(conn->read_buf);
     free(conn);
 }
 
-// Reset outgoing fixed sockets so they can be retried
 static void on_outgoing_close(uv_handle_t *handle) {
     peer_connection_t *conn = (peer_connection_t *)handle->data;
     conn->socket.type = UV_UNKNOWN_HANDLE; // Mark as safely closed
@@ -275,10 +273,8 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
         conn->is_connected = false;
 
         if (conn->peer_node_id == 0) {
-            // It's an incoming anonymous socket. Free it entirely.
             uv_close((uv_handle_t*)stream, on_anon_close);
         } else {
-            // It's a tracked outgoing connection. Mark closed to allow retry.
             uv_close((uv_handle_t*)stream, on_outgoing_close);
         }
 
@@ -304,7 +300,7 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
                 p2p_handle_incoming_frame(conn, msg_type, payload, payload_len);
                 processed += 5 + payload_len;
             } else {
-                break; // Need more bytes to complete frame
+                break;
             }
         }
 
@@ -333,7 +329,6 @@ static void try_connect(uv_timer_t *handle) {
     peer_connection_t *conn = (peer_connection_t *)handle->data;
     if (conn->is_connected || conn->peer_node_id == conn->server->opts.node_id) return;
 
-    // Wait until libuv safely closes the old handle before trying again
     if (conn->socket.type != UV_UNKNOWN_HANDLE) return;
 
     struct sockaddr_in dest;
@@ -355,9 +350,10 @@ static void on_ping_timer(uv_timer_t *handle) {
 static void on_accept(uv_stream_t *server, int status) {
     if (status < 0) return;
 
-    // PRODUCTION FIX: Initialize the socket inside the connection struct
+    paxos_server_t *s = (paxos_server_t *)server->data;
+
     peer_connection_t *anon_conn = calloc(1, sizeof(peer_connection_t));
-    anon_conn->server = ((peer_connection_t*)server->data)->server;
+    anon_conn->server = s;
     anon_conn->is_connected = true;
     anon_conn->read_cap = 4096;
     anon_conn->read_buf = malloc(4096);
@@ -375,50 +371,63 @@ static void on_accept(uv_stream_t *server, int status) {
 // --- PUBLIC P2P API ---
 
 void p2p_network_init(paxos_server_t *s) {
+    p2p_state_t *net = calloc(1, sizeof(p2p_state_t));
+    s->p2p_state = net;
+
     for (int i = 1; i <= 3; i++) {
-        g_peers[i].peer_node_id = i;
-        g_peers[i].server = s;
-        g_peers[i].is_connected = false;
-        g_peers[i].socket.type = UV_UNKNOWN_HANDLE; // Mark clean for first connect
-        g_peers[i].read_cap = 4096;
-        g_peers[i].read_buf = malloc(4096);
-        g_peers[i].read_pos = 0;
+        net->peers[i].peer_node_id = i;
+        net->peers[i].server = s;
+        net->peers[i].is_connected = false;
+        net->peers[i].socket.type = UV_UNKNOWN_HANDLE;
+        net->peers[i].read_cap = 4096;
+        net->peers[i].read_buf = malloc(4096);
+        net->peers[i].read_pos = 0;
 
-        g_peers[i].connect_req.data = &g_peers[i];
+        net->peers[i].connect_req.data = &net->peers[i];
 
-        uv_timer_init(&s->paxos_loop, &g_peers[i].reconnect_timer);
-        g_peers[i].reconnect_timer.data = &g_peers[i];
-        uv_timer_start(&g_peers[i].reconnect_timer, try_connect, 0, 1000);
+        uv_timer_init(&s->paxos_loop, &net->peers[i].reconnect_timer);
+        net->peers[i].reconnect_timer.data = &net->peers[i];
+        uv_timer_start(&net->peers[i].reconnect_timer, try_connect, 0, 1000);
 
-        uv_timer_init(&s->paxos_loop, &g_peers[i].ping_timer);
-        g_peers[i].ping_timer.data = &g_peers[i];
-        uv_timer_start(&g_peers[i].ping_timer, on_ping_timer, 500, 500);
+        uv_timer_init(&s->paxos_loop, &net->peers[i].ping_timer);
+        net->peers[i].ping_timer.data = &net->peers[i];
+        uv_timer_start(&net->peers[i].ping_timer, on_ping_timer, 500, 500);
     }
 
-    uv_tcp_init(&s->paxos_loop, &g_listener);
-    g_listener.data = &g_peers[1];
+    uv_tcp_init(&s->paxos_loop, &net->listener);
+    net->listener.data = s;
 
     struct sockaddr_in addr;
     uv_ip4_addr("0.0.0.0", s->opts.p2p_port, &addr);
-    uv_tcp_bind(&g_listener, (const struct sockaddr*)&addr, 0);
-    uv_listen((uv_stream_t*)&g_listener, 128, on_accept);
+    uv_tcp_bind(&net->listener, (const struct sockaddr*)&addr, 0);
+    uv_listen((uv_stream_t*)&net->listener, 128, on_accept);
 }
 
 int p2p_network_get_latency(paxos_server_t *s, uint64_t node_id) {
-    (void)s;
     if (node_id < 1 || node_id > 3) return -1;
-    if (!g_peers[node_id].is_connected) return -1;
-    return (int)g_peers[node_id].smoothed_latency_ms;
+    p2p_state_t *net = (p2p_state_t *)s->p2p_state;
+    if (!net->peers[node_id].is_connected) return -1;
+    return (int)net->peers[node_id].smoothed_latency_ms;
 }
 
 void p2p_network_send(paxos_server_t *s, uint64_t to_node, paxos_msg_t *msg) {
-    (void)s;
     if (to_node < 1 || to_node > 3) return;
-    peer_connection_t *conn = &g_peers[to_node];
+    p2p_state_t *net = (p2p_state_t *)s->p2p_state;
+    peer_connection_t *conn = &net->peers[to_node];
     if (!conn->is_connected) return;
 
     size_t len;
     uint8_t *buf = p2p_serialize_msg(msg, &len);
     network_send_raw(conn, NET_MSG_PAXOS, buf, len);
     free(buf);
+}
+
+void p2p_network_destroy(paxos_server_t *s) {
+    if (!s->p2p_state) return;
+    p2p_state_t *net = (p2p_state_t *)s->p2p_state;
+    for (int i = 1; i <= 3; i++) {
+        if (net->peers[i].read_buf) free(net->peers[i].read_buf);
+    }
+    free(net);
+    s->p2p_state = NULL;
 }

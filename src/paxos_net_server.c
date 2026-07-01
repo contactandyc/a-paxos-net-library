@@ -68,7 +68,6 @@ static void on_cmd_wakeup(uv_async_t *handle) {
         memcpy(payload + 9, curr->key, curr->klen);
         if (curr->vlen > 0) memcpy(payload + 9 + curr->klen, curr->val, curr->vlen);
 
-        // PRODUCTION FIX: Exactly one definition of paxos_propose error handling
         paxos_err_t err = paxos_propose(s->paxos, s->opts.node_id, curr->client_seq, payload, payload_len);
 
         if (err != PAXOS_OK) {
@@ -99,9 +98,6 @@ static void process_paxos_ready(paxos_server_t *s) {
     for (size_t i = 0; i < ready.num_messages_immediate; i++) {
         p2p_network_send(s, ready.messages_immediate[i].to, &ready.messages_immediate[i]);
     }
-
-    // In a production system, you would flush ready.entries_to_save to your WAL here.
-    // For now, we simulate instant persistence so the replication pipeline can proceed.
 
     for (size_t i = 0; i < ready.num_messages_after_persist; i++) {
         p2p_network_send(s, ready.messages_after_persist[i].to, &ready.messages_after_persist[i]);
@@ -139,7 +135,6 @@ static void process_paxos_ready(paxos_server_t *s) {
         sync_manager_tick(s);
     }
 
-    // Determine if ANY work was yielded by the state machine
     bool needs_advance = false;
     if (ready.hard_state.has_update ||
         ready.num_entries_to_save > 0 ||
@@ -158,7 +153,6 @@ static void process_paxos_ready(paxos_server_t *s) {
             }
         }
 
-        // Advance the state machine, clearing the queues and updating internal state
         paxos_advance(s->paxos, stable_slots, ready.num_entries_to_save, max_applied);
 
         if (stable_slots) free(stable_slots);
@@ -200,9 +194,9 @@ static void paxos_thread_entry(void *arg) {
     // Run the primary loop
     uv_run(&s->paxos_loop, UV_RUN_DEFAULT);
 
-    // --- ADD THESE 3 LINES FOR CLEAN TEARDOWN ---
+    // Clean teardown for libuv handles
     uv_walk(&s->paxos_loop, paxos_close_walk_cb, NULL);
-    uv_run(&s->paxos_loop, UV_RUN_DEFAULT); // Drain the close callbacks
+    uv_run(&s->paxos_loop, UV_RUN_DEFAULT);
     uv_loop_close(&s->paxos_loop);
 }
 
@@ -229,12 +223,10 @@ void paxos_server_run(paxos_server_t *s) {
 
     s->http_server = h2o_c_init(&s->opts.h2o);
 
-    // Bind the handlers explicitly to this server instance
     h2o_c_use(s->http_server, "GET", NULL, http_handler, s);
     h2o_c_use(s->http_server, "PUT", NULL, http_handler, s);
     h2o_c_use(s->http_server, "DELETE", NULL, http_handler, s);
 
-    // Run the isolated instance
     h2o_c_run(s->http_server);
 }
 
@@ -248,6 +240,7 @@ void paxos_server_stop(paxos_server_t *s) {
 
 void paxos_server_destroy(paxos_server_t *s) {
     if (!s) return;
+    p2p_network_destroy(s);
     paxos_destroy(s->paxos);
     h2o_c_destroy(s->http_server);
     free(s);

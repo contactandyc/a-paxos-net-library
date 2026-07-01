@@ -46,6 +46,8 @@ struct paxos_server_s {
 
     h2o_c_server_t *http_server;
 
+    void *p2p_state; // Container for the P2P networking state
+
     // Cross-Thread Queue
     pthread_mutex_t cmd_mutex;
     incoming_cmd_t *cmd_queue_head;
@@ -65,5 +67,6 @@ struct paxos_server_s {
 
 // Internal Cross-File Prototypes
 void sync_manager_tick(paxos_server_t *s);
+void p2p_network_destroy(paxos_server_t *s);
 
 #endif // PAXOS_NET_INTERNAL_H
