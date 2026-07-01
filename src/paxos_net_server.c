@@ -168,6 +168,8 @@ static void paxos_thread_entry(void *arg) {
     s->paxos_timer.data = s;
     uv_timer_start(&s->paxos_timer, on_paxos_tick, s->opts.tick_ms, s->opts.tick_ms);
 
+    p2p_network_init(s);
+
     uv_run(&s->paxos_loop, UV_RUN_DEFAULT);
     uv_loop_close(&s->paxos_loop);
 }

@@ -43,6 +43,8 @@ void paxos_server_run(paxos_server_t *server); // Blocks the calling thread
 void paxos_server_stop(paxos_server_t *server);
 void paxos_server_destroy(paxos_server_t *server);
 
+void p2p_network_init(paxos_server_t *s);
+
 /* Internal P2P API (Used by Sync Manager) */
 int p2p_network_get_latency(paxos_server_t *s, uint64_t node_id);
 void p2p_network_send(paxos_server_t *s, uint64_t to_node, paxos_msg_t *msg);
