@@ -52,10 +52,11 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
     uint32_t safe_num_entries = (msg->entries != NULL) ? msg->num_entries : 0;
     uint32_t safe_snap_len = (msg->snapshot_data != NULL) ? msg->snapshot_len : 0;
 
-    // PRODUCTION FIX: The base size of the header is exactly 83 bytes.
+    // The base size of the header is exactly 83 bytes.
     size_t req_len = 83;
     for (size_t i = 0; i < safe_num_entries; i++) {
-        req_len += 21 + msg->entries[i].data_len;
+        // FIX: Increased from 21 to 37 to account for the 16 bytes of client routing data
+        req_len += 37 + msg->entries[i].data_len;
     }
     req_len += safe_snap_len;
 
@@ -80,6 +81,11 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
         paxos_entry_t *e = &msg->entries[i];
         enc64(buf + ptr, e->slot); ptr += 8;
         enc64(buf + ptr, e->accepted_ballot); ptr += 8;
+
+        // FIX: Pack the client routing data
+        enc64(buf + ptr, e->client_id); ptr += 8;
+        enc64(buf + ptr, e->client_seq); ptr += 8;
+
         buf[ptr++] = e->type;
         enc32(buf + ptr, (uint32_t)e->data_len); ptr += 4;
         if (e->data_len > 0 && e->data != NULL) {
@@ -102,7 +108,7 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
 static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg) {
     memset(msg, 0, sizeof(paxos_msg_t));
 
-    // PRODUCTION FIX: Drop packets smaller than the 83-byte base header
+    // Drop packets smaller than the 83-byte base header
     if (len < 83) return;
 
     size_t ptr = 0;
@@ -123,10 +129,18 @@ static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg
     if (msg->num_entries > 0) {
         msg->entries = calloc(msg->num_entries, sizeof(paxos_entry_t));
         for (size_t i = 0; i < msg->num_entries; i++) {
-            if (ptr + 21 > len) break;
+
+            // FIX: Ensure we have at least 37 bytes remaining before reading
+            if (ptr + 37 > len) break;
+
             paxos_entry_t *e = &msg->entries[i];
             e->slot = dec64(buf + ptr); ptr += 8;
             e->accepted_ballot = dec64(buf + ptr); ptr += 8;
+
+            // FIX: Unpack the client routing data
+            e->client_id = dec64(buf + ptr); ptr += 8;
+            e->client_seq = dec64(buf + ptr); ptr += 8;
+
             e->type = buf[ptr++];
             e->data_len = dec32(buf + ptr); ptr += 4;
 
