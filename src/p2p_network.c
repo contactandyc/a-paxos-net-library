@@ -52,10 +52,10 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
     uint32_t safe_num_entries = (msg->entries != NULL) ? msg->num_entries : 0;
     uint32_t safe_snap_len = (msg->snapshot_data != NULL) ? msg->snapshot_len : 0;
 
-    // The base size of the header is exactly 83 bytes.
+    // Base header = 71 bytes. Trailer (Snapshot data) = 12 bytes. Total Base = 83.
     size_t req_len = 83;
     for (size_t i = 0; i < safe_num_entries; i++) {
-        // FIX: Increased from 21 to 37 to account for the 16 bytes of client routing data
+        // EXACTLY 37 bytes of metadata per entry
         req_len += 37 + msg->entries[i].data_len;
     }
     req_len += safe_snap_len;
@@ -77,17 +77,16 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
     buf[ptr++] = msg->snapshot_done ? 1 : 0;
 
     enc32(buf + ptr, safe_num_entries); ptr += 4;
+
     for (size_t i = 0; i < safe_num_entries; i++) {
         paxos_entry_t *e = &msg->entries[i];
         enc64(buf + ptr, e->slot); ptr += 8;
         enc64(buf + ptr, e->accepted_ballot); ptr += 8;
-
-        // FIX: Pack the client routing data
         enc64(buf + ptr, e->client_id); ptr += 8;
         enc64(buf + ptr, e->client_seq); ptr += 8;
-
         buf[ptr++] = e->type;
         enc32(buf + ptr, (uint32_t)e->data_len); ptr += 4;
+
         if (e->data_len > 0 && e->data != NULL) {
             memcpy(buf + ptr, e->data, e->data_len);
             ptr += e->data_len;
@@ -96,7 +95,8 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
 
     enc64(buf + ptr, msg->snapshot_offset); ptr += 8;
     enc32(buf + ptr, safe_snap_len); ptr += 4;
-    if (safe_snap_len > 0) {
+
+    if (safe_snap_len > 0 && msg->snapshot_data != NULL) {
         memcpy(buf + ptr, msg->snapshot_data, safe_snap_len);
         ptr += safe_snap_len;
     }
@@ -107,8 +107,6 @@ static uint8_t *p2p_serialize_msg(const paxos_msg_t *msg, size_t *out_len) {
 
 static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg) {
     memset(msg, 0, sizeof(paxos_msg_t));
-
-    // Drop packets smaller than the 83-byte base header
     if (len < 83) return;
 
     size_t ptr = 0;
@@ -126,30 +124,47 @@ static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg
     msg->snapshot_done = buf[ptr++] == 1;
 
     msg->num_entries = dec32(buf + ptr); ptr += 4;
-    if (msg->num_entries > 0) {
-        msg->entries = calloc(msg->num_entries, sizeof(paxos_entry_t));
-        for (size_t i = 0; i < msg->num_entries; i++) {
 
-            // FIX: Ensure we have at least 37 bytes remaining before reading
-            if (ptr + 37 > len) break;
+    // Cap the absolute maximum number of entries to prevent maliciously/corruptedly
+    // allocating infinite memory which causes the SIGABRT crash.
+    if (msg->num_entries > 0 && msg->num_entries < 10000) {
+        msg->entries = calloc(msg->num_entries, sizeof(paxos_entry_t));
+        if (!msg->entries) { msg->num_entries = 0; return; } // Memory failsafe
+
+        for (size_t i = 0; i < msg->num_entries; i++) {
+            if (ptr + 37 > len) {
+                // If the packet is truncated, cap the entries here safely
+                msg->num_entries = i;
+                break;
+            }
 
             paxos_entry_t *e = &msg->entries[i];
             e->slot = dec64(buf + ptr); ptr += 8;
             e->accepted_ballot = dec64(buf + ptr); ptr += 8;
-
-            // FIX: Unpack the client routing data
             e->client_id = dec64(buf + ptr); ptr += 8;
             e->client_seq = dec64(buf + ptr); ptr += 8;
-
             e->type = buf[ptr++];
             e->data_len = dec32(buf + ptr); ptr += 4;
 
-            if (e->data_len > 0 && ptr + e->data_len <= len) {
-                e->data = malloc(e->data_len);
-                memcpy(e->data, buf + ptr, e->data_len);
-                ptr += e->data_len;
+            if (e->data_len > 0) {
+                if (ptr + e->data_len <= len) {
+                    e->data = malloc(e->data_len);
+                    if (e->data) {
+                        memcpy(e->data, buf + ptr, e->data_len);
+                    }
+                    ptr += e->data_len;
+                } else {
+                    // Truncated data payload, cap the array to prevent passing
+                    // uninitialized or NULL pointers into the state machine.
+                    e->data = NULL;
+                    e->data_len = 0;
+                    msg->num_entries = i;
+                    break;
+                }
             }
         }
+    } else {
+        msg->num_entries = 0;
     }
 
     if (ptr + 12 <= len) {
@@ -157,7 +172,9 @@ static void p2p_deserialize_msg(const uint8_t *buf, size_t len, paxos_msg_t *msg
         msg->snapshot_len = dec32(buf + ptr); ptr += 4;
         if (msg->snapshot_len > 0 && ptr + msg->snapshot_len <= len) {
             msg->snapshot_data = malloc(msg->snapshot_len);
-            memcpy(msg->snapshot_data, buf + ptr, msg->snapshot_len);
+            if (msg->snapshot_data) {
+                memcpy(msg->snapshot_data, buf + ptr, msg->snapshot_len);
+            }
             ptr += msg->snapshot_len;
         }
     }
